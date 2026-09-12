@@ -1,0 +1,51 @@
+name: Build Hermes Chat x64 MSI
+
+on:
+  workflow_dispatch:
+
+jobs:
+  package:
+    name: Pake Tauri WebView2 WiX x64 MSI
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Pake source
+        uses: actions/checkout@v6
+
+      - name: Install Rust for the Windows x64 Tauri target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+
+      - name: Set up Node and pnpm
+        uses: ./.github/actions/setup-env
+        with:
+          mode: build
+
+      - name: Build Pake CLI
+        shell: pwsh
+        run: pnpm run cli:build
+
+      - name: Build the fixed Hermes Chat WebView2 MSI with WiX
+        shell: pwsh
+        run: |
+          Copy-Item configs/hermeschat-v2-pake.json src-tauri/pake.json -Force
+          $env:PAKE_CREATE_APP = '1'
+          node dist/cli.js https://chat.homertin.com --name HermesChat --width 1280 --height 900 --targets x64 --app-version 2.0.0 --json
+
+          $msi = Get-ChildItem src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi -Filter '*.msi' | Select-Object -First 1
+          if ($null -eq $msi) { throw 'Pake/Tauri did not produce an MSI.' }
+
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Copy-Item $msi.FullName artifacts/HermesChat-x64.msi -Force
+          (Get-FileHash artifacts/HermesChat-x64.msi -Algorithm SHA256).Hash | Set-Content -NoNewline artifacts/HermesChat-x64.msi.sha256
+
+      - name: Upload the x64 MSI
+        uses: actions/upload-artifact@v6
+        with:
+          name: HermesChat-x64
+          path: |
+            artifacts/HermesChat-x64.msi
+            artifacts/HermesChat-x64.msi.sha256
+          if-no-files-found: error
+          retention-days: 7
