@@ -33,7 +33,7 @@ jobs:
           $env:PAKE_CREATE_APP = '1'
           node dist/cli.js https://chat.homertin.com --name HermesChat --width 1280 --height 900 --targets x64 --app-version 2.0.0 --json
 
-          $msi = Get-ChildItem src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi -Filter '*.msi' | Select-Object -First 1
+          $msi = Get-ChildItem -Path . -Filter 'HermesChat.msi' -File -Recurse | Select-Object -First 1
           if ($null -eq $msi) { throw 'Pake/Tauri did not produce an MSI.' }
 
           New-Item -ItemType Directory -Force artifacts | Out-Null
