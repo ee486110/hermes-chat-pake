@@ -1,0 +1,130 @@
+name: Diagnose Hermes Chat Windows startup
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    name: Pake Tauri WebView2 Windows startup evidence
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Pake source
+        uses: actions/checkout@v6
+
+      - name: Install Rust for the Windows x64 Tauri target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+
+      - name: Set up Node and pnpm
+        uses: ./.github/actions/setup-env
+        with:
+          mode: build
+
+      - name: Build the existing Hermes Chat x64 MSI
+        shell: pwsh
+        run: |
+          pnpm run cli:build
+          Copy-Item configs/hermeschat-v2-pake.json src-tauri/pake.json -Force
+          $env:PAKE_CREATE_APP = '1'
+          node dist/cli.js https://chat.homertin.com --name HermesChat --width 1280 --height 900 --targets x64 --app-version 2.0.0 --json
+          $msi = Get-ChildItem -Path . -Filter 'HermesChat.msi' -File -Recurse | Select-Object -First 1
+          if ($null -eq $msi) { throw 'Pake/Tauri did not produce HermesChat.msi.' }
+          New-Item -ItemType Directory -Force diagnostic | Out-Null
+          Copy-Item $msi.FullName diagnostic/HermesChat-x64.msi -Force
+
+      - name: Install and diagnose the existing MSI without a shortcut
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $diagnostic = Join-Path $PWD 'diagnostic'
+          $msi = Join-Path $diagnostic 'HermesChat-x64.msi'
+          $installLog = Join-Path $diagnostic 'msi-install.log'
+          $startedAt = Get-Date
+
+          $install = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/qn', '/norestart', '/l*v', $installLog) -Wait -PassThru
+          $installedPrograms = Get-ChildItem 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+            Get-ItemProperty |
+            Where-Object { $_.DisplayName -eq 'HermesChat' }
+          $installLocations = @($installedPrograms | ForEach-Object { $_.InstallLocation } | Where-Object { $_ })
+          $roots = @($installLocations + @($env:ProgramFiles, ${env:ProgramFiles(x86)})) | Select-Object -Unique
+          $exe = foreach ($root in $roots) {
+            if (Test-Path $root) {
+              Get-ChildItem -Path $root -Filter 'pake-hermeschat.exe' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            }
+          } | Select-Object -First 1
+          if ($null -eq $exe) { throw 'Installed pake-hermeschat.exe was not found.' }
+
+          $stdout = Join-Path $diagnostic 'pake-hermeschat.stdout.txt'
+          $stderr = Join-Path $diagnostic 'pake-hermeschat.stderr.txt'
+          $process = Start-Process -FilePath $exe.FullName -WorkingDirectory $exe.DirectoryName -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          Start-Sleep -Seconds 15
+          $process.Refresh()
+          $stillRunning = -not $process.HasExited
+          $exitCode = if ($stillRunning) { $null } else { $process.ExitCode }
+          if ($stillRunning) { Stop-Process -Id $process.Id -Force }
+
+          $shell = New-Object -ComObject WScript.Shell
+          $startMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'
+          $shortcuts = Get-ChildItem -Path $startMenu -Filter '*.lnk' -File -Recurse -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              $shortcut = $shell.CreateShortcut($_.FullName)
+              [pscustomobject]@{ Path = $_.FullName; TargetPath = $shortcut.TargetPath; WorkingDirectory = $shortcut.WorkingDirectory; Arguments = $shortcut.Arguments }
+            } |
+            Where-Object { $_.TargetPath -eq $exe.FullName }
+
+          $webView2 = foreach ($key in @(
+            'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\*',
+            'HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\*'
+          )) {
+            Get-ItemProperty -Path $key -ErrorAction SilentlyContinue | Where-Object { $_.name -match 'WebView2' } |
+              Select-Object PSPath, name, pv, version
+          }
+
+          $applicationEvents = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $startedAt.AddMinutes(-1) } -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -match 'Application Error|Windows Error Reporting|SideBySide' -or $_.Message -match 'pake-hermeschat|HermesChat|WebView2' } |
+            Select-Object TimeCreated, ProviderName, Id, LevelDisplayName, Message
+
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $installer.OpenDatabase($msi, 0)
+          function Get-MsiRows([string]$query, [string[]]$columns) {
+            $view = $database.OpenView($query)
+            $view.Execute()
+            $rows = @()
+            while ($record = $view.Fetch()) {
+              $row = [ordered]@{}
+              for ($i = 0; $i -lt $columns.Count; $i++) { $row[$columns[$i]] = $record.StringData($i + 1) }
+              $rows += [pscustomobject]$row
+            }
+            $view.Close()
+            return $rows
+          }
+
+          $report = [ordered]@{
+            installExitCode = $install.ExitCode
+            installedProgram = @($installedPrograms | Select-Object DisplayName, DisplayVersion, InstallLocation, UninstallString)
+            executable = [ordered]@{ path = $exe.FullName; exists = (Test-Path $exe.FullName); sizeBytes = $exe.Length }
+            directLaunch = [ordered]@{ processCreated = ($null -ne $process); processId = $process.Id; stillRunningAfter15Seconds = $stillRunning; exitCode = $exitCode; stdout = (Get-Content $stdout -Raw -ErrorAction SilentlyContinue); stderr = (Get-Content $stderr -Raw -ErrorAction SilentlyContinue) }
+            shortcuts = @($shortcuts)
+            webView2Runtime = @($webView2)
+            applicationEvents = @($applicationEvents)
+            installedFiles = @(Get-ChildItem -Path $exe.DirectoryName -File -Recurse | Select-Object FullName, Length)
+            msiTables = [ordered]@{
+              File = @(Get-MsiRows 'SELECT `File`,`Component_`,`FileName`,`FileSize`,`Version` FROM `File`' @('File','Component','FileName','FileSize','Version'))
+              Component = @(Get-MsiRows 'SELECT `Component`,`ComponentId`,`Directory_`,`Attributes`,`Condition`,`KeyPath` FROM `Component`' @('Component','ComponentId','Directory','Attributes','Condition','KeyPath'))
+              Shortcut = @(Get-MsiRows 'SELECT `Shortcut`,`Directory_`,`Name`,`Component_`,`Target`,`WkDir` FROM `Shortcut`' @('Shortcut','Directory','Name','Component','Target','WorkingDirectory'))
+            }
+          }
+          $report | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $diagnostic 'startup-report.json') -Encoding utf8
+          if ($install.ExitCode -ne 0) { throw "MSI installation failed with exit code $($install.ExitCode)." }
+
+      - name: Upload startup diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: HermesChat-Windows-startup-diagnostic
+          path: diagnostic
+          if-no-files-found: error
+          retention-days: 7
